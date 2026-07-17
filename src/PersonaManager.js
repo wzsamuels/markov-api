@@ -18,7 +18,7 @@ class PersonaManager {
   getDatabase(personaName) {
     if (!this.#connections[personaName]) {
       try {
-        const dbRoot = process.env.ENV === 'prod' ? '/' : process.cwd();
+        const dbRoot = process.env.ENV === 'production' ? '/' : process.cwd();
         const dbPath = path.join(dbRoot, `${process.env.DATA_DIR}/${personaName}_markov.db`);
 
         console.log(`Loading personality: ${personaName} from ${dbPath}`);
