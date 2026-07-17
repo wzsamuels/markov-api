@@ -1,5 +1,5 @@
 import Fastify from 'fastify';
-import MarkovGenerator from './MarkovGenerator.js';
+import MarkovGenerator from './src/MarkovGenerator.js';
 
 const fastify = Fastify({ logger: true });
 

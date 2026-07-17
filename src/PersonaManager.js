@@ -1,12 +1,12 @@
+import 'dotenv/config';
 import Database from 'better-sqlite3';
 import path from 'path';
-import { DATA_DIR, ENV } from './config.js';
 
 const requiredEnvVars = ['DATA_DIR', 'ENV'];
 for (const envVar of requiredEnvVars) {
   if (!process.env[envVar]) {
     const error = new Error(`Missing required environment variable: ${envVar}`);
-    logError(error, 'Configuration');
+    console.error('Error loading environment variables:', error.message);
     throw error;
   }
 }
