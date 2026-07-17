@@ -32,7 +32,7 @@ class MarkovGenerator {
     }
 
     if (!row) {
-      return ["I need to be trained with some text first!"];
+      return "I need to be trained with some text first!";
     }
 
     let currentState = row.state;
@@ -68,14 +68,14 @@ class MarkovGenerator {
       if (['.', '?', '!'].includes(nextToken.slice(-1))) break;
     }
 
-    return [result.join(' ')];
+    return result.join(' ');
   }
 
   generateReply(userPrompt, maxTokens = 30) {
     // Quick check to ensure the database is populated
     const hasData = this.#db.prepare(`SELECT 1 FROM n_grams LIMIT 1`).get();
     if (!hasData) {
-      return ["I need to be trained with some text first!"];
+      return "I need to be trained with some text first!";
     }
 
     const promptTokens = userPrompt.trim().split(/\s+/);
@@ -196,8 +196,8 @@ class MarkovGenerator {
       finalResponse += '.';
     }
 
-    return [finalResponse];
+    return finalResponse;
   }
 }
 
-export default MarkovGenerator
+export default MarkovGenerator;

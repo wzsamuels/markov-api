@@ -9,7 +9,7 @@ const bots = {
   blended: new MarkovGenerator('blended')
 }
 
-fastify.post('/api/chat', async(request, reply) => {
+fastify.post('/generate', async(request, reply) => {
   const { prompt, persona = 'blended' } = request.body;
 
   if (!prompt) {
