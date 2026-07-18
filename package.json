@@ -1,4 +1,9 @@
 {
+  "name": "markov-api",
+  "version": "1.0.0",
+  "description": "Fastify API for a Markov chain text generator",
+  "type": "module",
+  "main": "server.js",
   "dependencies": {
     "better-sqlite3": "^12.11.1",
     "dotenv": "^17.4.2",
