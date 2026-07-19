@@ -34,8 +34,8 @@ fastify.post('/generate', async(request, reply) => {
 
 const start = async () => {
   try {
-    await fastify.listen({ port:3001, host: '0.0.0.0' });
-    console.log(`Server listening on http://localhost:3001`);
+    await fastify.listen({ port:5001, host: '127.0.0.1' });
+    console.log(`Server listening on http://127.0.0.1:5001`);
   } catch (error) {
     fastify.log.error(error);
     process.exit(1);
