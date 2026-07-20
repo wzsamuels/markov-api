@@ -10,7 +10,7 @@ const bots = {
 }
 
 fastify.post('/generate', async(request, reply) => {
-  const { prompt, persona = 'blended' } = request.body;
+  const { prompt, persona = 'blended', max_new_tokens = 30 } = request.body;
 
   if (!prompt) {
     return reply.status(400).send({ error: 'Prompt is required' });
@@ -19,7 +19,7 @@ fastify.post('/generate', async(request, reply) => {
   const bot = bots[persona] || bots['blended'];
 
   try {
-    const reponseText = bot.generateReply(prompt);
+    const reponseText = bot.generateReply(prompt, max_new_tokens);
 
     return {
       prompt: prompt,
