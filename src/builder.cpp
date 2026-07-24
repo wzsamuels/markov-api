@@ -3,10 +3,18 @@
 #include <sstream>
 #include <vector>
 #include <string>
+#include <unordered_map>
+#include <map>
 #include <filesystem>
 #include <sqlite3.h>
 
 namespace fs = std::filesystem;
+
+// Configuration
+const int MARKOV_ORDER = 3;
+const int MIN_FREQUENCY = 2; // Strategy 2: Prune transitions occurring fewer than 2 times
+const std::string DATA_PATH = "./data/soda_data";
+const std::string DB_PATH = "markov-soda-optimized.db";
 
 // Helper to execute simple SQL commands
 void execute_sql(sqlite3* db, const std::string& sql) {
@@ -28,167 +36,205 @@ std::vector<std::string> tokenize(const std::string& text) {
     return tokens;
 }
 
-std::string clean_gutenberg_text(const std::string& text) {
-    // 1. Locate the START marker
-    size_t start_pos = text.find("*** START OF THE PROJECT GUTENBERG");
-    if (start_pos == std::string::npos) {
-        start_pos = text.find("*** START OF THIS PROJECT GUTENBERG");
-    }
-    
-    // If we found the start text, we need to advance past its closing asterisks
-    if (start_pos != std::string::npos) {
-        size_t closing_asterisks = text.find("***", start_pos + 10);
-        if (closing_asterisks != std::string::npos) {
-            start_pos = closing_asterisks + 3; // Move the index completely past the asterisks
-        } else {
-            start_pos = 0; // Fallback if formatting is completely broken
+int main(int argc, char) {
+    // --- Strategy 1 & 2: In-Memory Data Structures ---
+    std::unordered_map<std::string, int> vocab_to_id;
+    std::vector<std::string> id_to_vocab;
+
+    // Helper lambda for integer token mapping
+    auto get_or_create_token_id = [&](const std::string& token) -> int {
+        auto it = vocab_to_id.find(token);
+        if (it != vocab_to_id.end()) {
+            return it->second;
         }
-    } else {
-        start_pos = 0;
-    }
+        int new_id = static_cast<int>(id_to_vocab.size());
+        vocab_to_id[token] = new_id;
+        id_to_vocab.push_back(token);
+        return new_id;
+    };
 
-    // 2. Locate the END marker (starting the search from where the header ended)
-    size_t end_pos = text.find("*** END OF THE PROJECT GUTENBERG", start_pos);
-    if (end_pos == std::string::npos) {
-        end_pos = text.find("*** END OF THIS PROJECT GUTENBERG", start_pos);
-    }
+    // State representation using an array of 3 integer token IDs
+    using StateVec = std::vector<int>; 
+    std::map<StateVec, int> state_to_id;
+    std::vector<StateVec> id_to_state;
+    std::unordered_map<int, bool> state_is_start;
 
-    // If no end marker is found, we'll just read to the end of the file
-    if (end_pos == std::string::npos) {
-        end_pos = text.length();
-    }
+    auto get_or_create_state_id = [&](const StateVec& state_vec, bool is_start) -> int {
+        auto it = state_to_id.find(state_vec);
+        int state_id;
+        if (it != state_to_id.end()) {
+            state_id = it->second;
+            if (is_start) state_is_start[state_id] = true;
+        } else {
+            state_id = static_cast<int>(id_to_state.size());
+            state_to_id[state_vec] = state_id;
+            id_to_state.push_back(state_vec);
+            state_is_start[state_id] = is_start;
+        }
+        return state_id;
+    };
 
-    // 3. Slice and return the actual book text
-    if (start_pos < end_pos) {
-        return text.substr(start_pos, end_pos - start_pos);
-    }
-    
-    return text;
-}
+    // Transition maps: <pair<state_id, token_id>, count>
+    std::map<std::pair<int, int>, int> forward_counts;
+    std::map<std::pair<int, int>, int> reverse_counts;
 
-int main() {
-    sqlite3* db;
-    if (sqlite3_open("markov-soda.db", &db) != SQLITE_OK) {
-        std::cerr << "Failed to open database\n";
-        return 1;
-    }
-
-    // Optimize SQLite for massive bulk inserts
-    execute_sql(db, "PRAGMA journal_mode = WAL;");
-    execute_sql(db, "PRAGMA synchronous = NORMAL;");
-
-    // Initialize Schema
-    execute_sql(db, R"(
-        CREATE TABLE IF NOT EXISTS n_grams (
-            state TEXT PRIMARY KEY,
-            is_start BOOLEAN DEFAULT 0
-        );
-        CREATE TABLE IF NOT EXISTS transitions (
-            state TEXT,
-            next_token TEXT,
-            frequency INTEGER DEFAULT 1,
-            PRIMARY KEY (state, next_token),
-            FOREIGN KEY (state) REFERENCES n_grams(state)
-        );
-        CREATE TABLE IF NOT EXISTS reverse_transitions (
-            state TEXT,
-            prev_token TEXT,
-            frequency INTEGER DEFAULT 1,
-            PRIMARY KEY (state, prev_token),
-            FOREIGN KEY (state) REFERENCES n_grams(state)
-        );
-        CREATE INDEX IF NOT EXISTS idx_transitions_state ON transitions(state);
-        CREATE INDEX IF NOT EXISTS idx_reverse_state ON reverse_transitions(state);
-
-        CREATE INDEX IF NOT EXISTS idx_ngrams_nocase ON n_grams(state COLLATE NOCASE);
-    )");
-
-    // Prepare SQL statements once to maximize loop efficiency
-    sqlite3_stmt* insert_state;
-    sqlite3_stmt* insert_transition;
-    sqlite3_stmt* insert_reverse;
-    
-    const char* sql_state = "INSERT INTO n_grams (state, is_start) VALUES (?, ?) ON CONFLICT(state) DO UPDATE SET is_start = excluded.is_start OR is_start;";
-    const char* sql_trans = "INSERT INTO transitions (state, next_token, frequency) VALUES (?, ?, 1) ON CONFLICT(state, next_token) DO UPDATE SET frequency = frequency + 1;";
-    const char* sql_rev = "INSERT INTO reverse_transitions (state, prev_token, frequency) VALUES (?, ?, 1) ON CONFLICT(state, prev_token) DO UPDATE SET frequency = frequency + 1;";
-    
-    sqlite3_prepare_v2(db, sql_state, -1, &insert_state, nullptr);
-    sqlite3_prepare_v2(db, sql_trans, -1, &insert_transition, nullptr);
-    sqlite3_prepare_v2(db, sql_rev, -1, &insert_reverse, nullptr);
-
-    // Wrap the entire parsing phase in a single transaction
-    execute_sql(db, "BEGIN TRANSACTION;");
-
-    int order = 3; // Match your bot's Markov order
-    std::string data_path = "./data/soda_data"; // Path to your Gutenberg text files
+    std::cout << "Parsing text files into memory...\n";
 
     int counter = 0;
-    for (const auto& entry : fs::directory_iterator(data_path)) {
-        counter++;
-        if (counter == 600) break; // Limit to 300 files for testing
-
+    for (const auto& entry : fs::directory_iterator(DATA_PATH)) {
         if (entry.path().extension() == ".txt") {
-            std::cout << "Processing: " << entry.path().filename() << "\n";
-            
+            counter++;
+            if (counter % 100 == 0) {
+                std::cout << "Processed " << counter << " files...\n";
+            }
+
             std::ifstream file(entry.path());
             std::stringstream buffer;
             buffer << file.rdbuf();
             std::string content = buffer.str();
-            
-            content = clean_gutenberg_text(content);            
-            
-            std::vector<std::string> tokens = tokenize(content);
-            if (tokens.size() <= order) continue;
 
-            for (size_t i = 0; i < tokens.size() - order; ++i) {
-                std::string state = "";
-                for (int j = 0; j < order; ++j) {
-                    state += tokens[i + j] + (j < order - 1 ? " " : "");
-                }
-                std::string next_token = tokens[i + order];
+            std::vector<std::string> raw_tokens = tokenize(content);
+            if (raw_tokens.size() <= MARKOV_ORDER) continue;
 
-                // Determine if this is a starting state
-                int is_start = 0;
+            // Convert string tokens to integer IDs
+            std::vector<int> token_ids;
+            token_ids.reserve(raw_tokens.size());
+            for (const auto& token : raw_tokens) {
+                token_ids.push_back(get_or_create_token_id(token));
+            }
+
+            // Build n-grams and transition frequencies in RAM
+            for (size_t i = 0; i <= token_ids.size() - MARKOV_ORDER - 1; ++i) {
+                StateVec state_vec(token_ids.begin() + i, token_ids.begin() + i + MARKOV_ORDER);
+
+                bool is_start = false;
                 if (i == 0) {
-                    is_start = 1;
+                    is_start = true;
                 } else {
-                    char last_char = tokens[i - 1].back();
-                    if (last_char == '.' || last_char == '?' || last_char == '!') is_start = 1;
-                }            
+                    char last_char = raw_tokens[i - 1].back();
+                    if (last_char == '.' || last_char == '?' || last_char == '!') {
+                        is_start = true;
+                    }
+                }
 
-                // Bind and execute State insertion
-                sqlite3_bind_text(insert_state, 1, state.c_str(), -1, SQLITE_TRANSIENT);
-                sqlite3_bind_int(insert_state, 2, is_start);
-                sqlite3_step(insert_state);
-                sqlite3_reset(insert_state);
+                int state_id = get_or_create_state_id(state_vec, is_start);
+                int next_token_id = token_ids[i + MARKOV_ORDER];
+                forward_counts[{state_id, next_token_id}]++;
 
-                // Bind and execute Transition insertion
-                sqlite3_bind_text(insert_transition, 1, state.c_str(), -1, SQLITE_TRANSIENT);
-                sqlite3_bind_text(insert_transition, 2, next_token.c_str(), -1, SQLITE_TRANSIENT);
-                sqlite3_step(insert_transition);
-                sqlite3_reset(insert_transition);
-
-                // Bind and execute Reverse Transition insertion
                 if (i > 0) {
-                    std::string prev_token = tokens[i - 1];
-                    sqlite3_bind_text(insert_reverse, 1, state.c_str(), -1, SQLITE_TRANSIENT);
-                    sqlite3_bind_text(insert_reverse, 2, prev_token.c_str(), -1, SQLITE_TRANSIENT);
-                    sqlite3_step(insert_reverse);
-                    sqlite3_reset(insert_reverse);
+                    int prev_token_id = token_ids[i - 1];
+                    reverse_counts[{state_id, prev_token_id}]++;
                 }
             }
         }
     }
 
-    // Commit the transaction to disk
-    execute_sql(db, "COMMIT;");
+    std::cout << "Parsing complete.\n";
+    std::cout << "Unique Tokens: " << id_to_vocab.size() << "\n";
+    std::cout << "Unique States: " << id_to_state.size() << "\n";
 
-    // Clean up
-    sqlite3_finalize(insert_state);
-    sqlite3_finalize(insert_transition);
-    sqlite3_finalize(insert_reverse);
+    // --- Strategy 3: Database Schema Initialization ---
+    sqlite3* db;
+    if (sqlite3_open(DB_PATH.c_str(), &db) != SQLITE_OK) {
+        std::cerr << "Failed to open database\n";
+        return 1;
+    }
+
+    execute_sql(db, "PRAGMA journal_mode = WAL;");
+    execute_sql(db, "PRAGMA synchronous = NORMAL;");
+
+    // Optimized Schema using INTEGER keys and WITHOUT ROWID
+    execute_sql(db, R"(
+        CREATE TABLE IF NOT EXISTS vocabulary (
+            id INTEGER PRIMARY KEY,
+            token TEXT UNIQUE
+        );
+
+        CREATE TABLE IF NOT EXISTS n_grams (
+            id INTEGER PRIMARY KEY,
+            token1_id INT,
+            token2_id INT,
+            token3_id INT,
+            is_start INT
+        );
+
+        CREATE TABLE IF NOT EXISTS transitions (
+            state_id INT,
+            next_token_id INT,
+            frequency INT,
+            PRIMARY KEY (state_id, next_token_id)
+        ) WITHOUT ROWID;
+
+        CREATE TABLE IF NOT EXISTS reverse_transitions (
+            state_id INT,
+            prev_token_id INT,
+            frequency INT,
+            PRIMARY KEY (state_id, prev_token_id)
+        ) WITHOUT ROWID;
+
+        CREATE INDEX IF NOT EXISTS idx_transitions_state ON transitions(state_id);
+        CREATE INDEX IF NOT EXISTS idx_reverse_state ON reverse_transitions(state_id);
+    )");
+
+    std::cout << "Writing optimized data to SQLite...\n";
+    execute_sql(db, "BEGIN TRANSACTION;");
+
+    // 1. Flush Vocabulary
+    sqlite3_stmt* stmt_vocab;
+    sqlite3_prepare_v2(db, "INSERT INTO vocabulary (id, token) VALUES (?, ?);", -1, &stmt_vocab, nullptr);
+    for (size_t id = 0; id < id_to_vocab.size(); ++id) {
+        sqlite3_bind_int(stmt_vocab, 1, static_cast<int>(id));
+        sqlite3_bind_text(stmt_vocab, 2, id_to_vocab[id].c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_step(stmt_vocab);
+        sqlite3_reset(stmt_vocab);
+    }
+    sqlite3_finalize(stmt_vocab);
+
+    // 2. Flush States
+    sqlite3_stmt* stmt_state;
+    sqlite3_prepare_v2(db, "INSERT INTO n_grams (id, token1_id, token2_id, token3_id, is_start) VALUES (?, ?, ?, ?, ?);", -1, &stmt_state, nullptr);
+    for (size_t id = 0; id < id_to_state.size(); ++id) {
+        sqlite3_bind_int(stmt_state, 1, static_cast<int>(id));
+        sqlite3_bind_int(stmt_state, 2, id_to_state[id][0]);
+        sqlite3_bind_int(stmt_state, 3, id_to_state[id][1]);
+        sqlite3_bind_int(stmt_state, 4, id_to_state[id][2]);
+        sqlite3_bind_int(stmt_state, 5, state_is_start[static_cast<int>(id)] ? 1 : 0);
+        sqlite3_step(stmt_state);
+        sqlite3_reset(stmt_state);
+    }
+    sqlite3_finalize(stmt_state);
+
+    // 3. Flush Forward Transitions (Applying Frequency Pruning)
+    sqlite3_stmt* stmt_trans;
+    sqlite3_prepare_v2(db, "INSERT INTO transitions (state_id, next_token_id, frequency) VALUES (?, ?, ?);", -1, &stmt_trans, nullptr);
+    for (const auto& [key, freq] : forward_counts) {
+        if (freq < MIN_FREQUENCY) continue; // PRUNING
+
+        sqlite3_bind_int(stmt_trans, 1, key.first);
+        sqlite3_bind_int(stmt_trans, 2, key.second);
+        sqlite3_bind_int(stmt_trans, 3, freq);
+        sqlite3_step(stmt_trans);
+        sqlite3_reset(stmt_trans);
+    }
+    sqlite3_finalize(stmt_trans);
+
+    // 4. Flush Reverse Transitions (Applying Frequency Pruning)
+    sqlite3_stmt* stmt_rev;
+    sqlite3_prepare_v2(db, "INSERT INTO reverse_transitions (state_id, prev_token_id, frequency) VALUES (?, ?, ?);", -1, &stmt_rev, nullptr);
+    for (const auto& [key, freq] : reverse_counts) {
+        if (freq < MIN_FREQUENCY) continue; // PRUNING
+
+        sqlite3_bind_int(stmt_rev, 1, key.first);
+        sqlite3_bind_int(stmt_rev, 2, key.second);
+        sqlite3_bind_int(stmt_rev, 3, freq);
+        sqlite3_step(stmt_rev);
+        sqlite3_reset(stmt_rev);
+    }
+    sqlite3_finalize(stmt_rev);
+
+    execute_sql(db, "COMMIT;");
     sqlite3_close(db);
 
-    std::cout << "Database build complete.\n";
+    std::cout << "Database build complete. Saved to " << DB_PATH << "\n";
     return 0;
 }
