@@ -6,6 +6,7 @@
 #include <unordered_map>
 #include <map>
 #include <filesystem>
+#include <string_view>
 #include <sqlite3.h>
 
 namespace fs = std::filesystem;
@@ -13,8 +14,8 @@ namespace fs = std::filesystem;
 // Configuration
 const int MARKOV_ORDER = 3;
 const int MIN_FREQUENCY = 2; // Strategy 2: Prune transitions occurring fewer than 2 times
-const std::string DATA_PATH = "./data/soda_data";
-const std::string DB_PATH = "markov-soda-optimized.db";
+//const std::string DATA_PATH = "./data/soda_data";
+//const std::string DB_PATH = "markov-soda-optimized.db";
 
 // Helper to execute simple SQL commands
 void execute_sql(sqlite3* db, const std::string& sql) {
@@ -36,7 +37,22 @@ std::vector<std::string> tokenize(const std::string& text) {
     return tokens;
 }
 
-int main(int argc, char) {
+int main(int argc, char* argv[]) {
+    std::vector<std::string> args(argv, argv + argc);
+
+    for (const auto& arg : args) {
+        std::cout << arg << "\n";
+    }
+
+    if (argc != 3) {
+        std::cout << "Provide input directory and output file as arguments.\n";
+
+        return 1; 
+    }
+
+    const std::string DATA_PATH = args[1];
+    const std::string DB_PATH = args[2];
+
     // --- Strategy 1 & 2: In-Memory Data Structures ---
     std::unordered_map<std::string, int> vocab_to_id;
     std::vector<std::string> id_to_vocab;
